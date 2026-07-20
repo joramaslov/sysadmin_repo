@@ -1,0 +1,697 @@
+# Инструкция по установке и эксплуатации UBKA
+
+Рабочий сервер: `10.78.3.81`  
+Hostname: `ubka`  
+Адрес: `https://ubka.gasvybory2.ru`  
+HAProxy/VIP: `81.177.104.164`
+
+> Сервер `10.78.3.62` к UBKA не относится и в настоящей инструкции не используется.
+
+## 1. Назначение
+
+Инструкция описывает  проверку состояния, штатный запуск, остановку, перезагрузку, обновление приложения, создание администратора, резервное копирование и восстановление.
+
+
+## 2. Фактическая архитектура
+
+| Компонент | Текущее значение |
+|---|---|
+| ОС | Ubuntu Server 24.04.3 LTS |
+| Python | 3.12.3 |
+| Приложение | Django 5.1.6 |
+| Каталог | `/home/user/ubka` |
+| Виртуальное окружение | `/home/user/ubka/venv` |
+| Веб-сервер | Nginx 1.24, порт `80` |
+| ASGI | Daphne, Unix-сокет `/run/daphne/daphne.sock` |
+| Фоновые задачи | Celery под управлением Supervisor |
+| База данных | PostgreSQL 16, база `ubka2`, роль `ubka` |
+| Кэш/Channels | Redis на `127.0.0.1:6379` |
+| Очереди | RabbitMQ |
+| Переменные приложения | `/home/user/ubka/.env` |
+| Статика | `/home/user/ubka/static` |
+| Пользовательские файлы | `/home/user/ubka/media` |
+| Резервная копия БД | `/usr/local/sbin/database_backup.sh` в `00:03` |
+
+Схема запроса:
+
+```text
+Пользователь
+    -> HAProxy 81.177.104.164 (HTTPS)
+    -> 10.78.3.81:80 (HTTP)
+    -> Nginx
+    -> /run/daphne/daphne.sock
+    -> Django UBKA
+```
+
+Nginx отдельно отдаёт `/static/`, `/media/`, `/templates/` и поддерживает WebSocket на `/ws/`.
+
+## 3. Важные текущие наблюдения
+
+- Каталог `/home/user/ubka` занимает около 142 GB.
+- База `ubka2` занимает около 5.9 GB.
+- Файл `.env` содержит пароли и токены.
+- Каталог `venv` нельзя переносить между разными версиями ОС/Python — он создаётся заново из `requirements.txt`.
+
+## 4. Быстрая проверка состояния
+
+```bash
+ssh user@10.78.3.81
+```
+
+Проверить основные службы:
+
+```bash
+sudo systemctl status \
+  nginx daphne supervisor \
+  postgresql@16-main redis-server rabbitmq-server \
+  --no-pager -l
+```
+
+Проверить процессы Supervisor:
+
+```bash
+sudo supervisorctl status
+```
+
+Ожидаемые процессы:
+
+```text
+celery-beat:celery-beat_00
+celery-import-export:celery-import-export_00
+celery-worker:celery-worker_00
+celery_exporter
+django_bot
+helper-celery:helper-celery_00
+```
+
+Все они должны иметь состояние `RUNNING`.
+
+Проверить порт, сокет и приложение:
+
+```bash
+sudo ss -lntp | grep ':80'
+sudo ls -l /run/daphne/daphne.sock
+curl -sS -D- -o /dev/null \
+  -H 'Host: ubka.gasvybory2.ru' \
+  http://127.0.0.1/
+```
+
+Нормальный ответ для пользователя без авторизации:
+
+```text
+HTTP/1.1 302 Found
+Location: /account/login/?next=/
+```
+
+Внешняя проверка:
+
+```bash
+curl -k -sS -D- -o /dev/null https://ubka.gasvybory2.ru/
+```
+
+## 5. Штатный запуск
+
+Соблюдать порядок: БД и брокеры, Django, фоновые процессы, Nginx.
+
+```bash
+sudo systemctl start postgresql@16-main
+sudo systemctl start redis-server
+sudo systemctl start rabbitmq-server
+sudo systemctl start daphne
+sudo systemctl start supervisor
+sudo supervisorctl start all
+sudo systemctl start nginx
+```
+
+После запуска:
+
+```bash
+sudo supervisorctl status
+sudo systemctl is-active \
+  postgresql@16-main redis-server rabbitmq-server \
+  daphne supervisor nginx
+curl -sS -D- -o /dev/null \
+  -H 'Host: ubka.gasvybory2.ru' \
+  http://127.0.0.1/
+```
+
+## 6. Штатная остановка
+
+### 6.1. Остановить только приложение
+
+```bash
+sudo systemctl stop nginx
+sudo supervisorctl stop all
+sudo systemctl stop daphne
+```
+
+PostgreSQL, Redis и RabbitMQ при этом остаются запущенными.
+
+### 6.2. Полная остановка
+
+Только в согласованное окно:
+
+```bash
+sudo systemctl stop nginx
+sudo supervisorctl stop all
+sudo systemctl stop daphne
+sudo systemctl stop supervisor
+sudo systemctl stop rabbitmq-server
+sudo systemctl stop redis-server
+sudo systemctl stop postgresql@16-main
+```
+
+## 7. Перезагрузка
+
+### 7.1. Перезагрузка Nginx после изменения конфигурации
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Использовать `reload`, если нужно только применить корректную конфигурацию Nginx без жёсткой остановки соединений.
+
+### 7.2. Перезапуск Django/Daphne
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/python manage.py check
+sudo systemctl restart daphne
+sudo systemctl status daphne --no-pager -l
+```
+
+### 7.3. Перезапуск всех фоновых процессов
+
+```bash
+sudo supervisorctl restart all
+sudo supervisorctl status
+```
+
+Это затрагивает Celery, планировщик, импорт/экспорт, exporter и бота.
+
+### 7.4. Перезапуск отдельного процесса
+
+```bash
+sudo supervisorctl restart celery-worker:*
+sudo supervisorctl restart celery-import-export:*
+sudo supervisorctl restart celery-beat:*
+sudo supervisorctl restart helper-celery:*
+sudo supervisorctl restart celery_exporter
+sudo supervisorctl restart django_bot
+```
+
+Перезапускать только компонент, к которому относится изменение или неисправность.
+
+### 7.5. Полная перезагрузка приложения
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/python manage.py check
+sudo systemctl restart daphne
+sudo supervisorctl restart all
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Проверка:
+
+```bash
+sudo supervisorctl status
+curl -sS -D- -o /dev/null \
+  -H 'Host: ubka.gasvybory2.ru' \
+  http://127.0.0.1/
+```
+
+## 8. Перезагрузка самого сервера
+
+Перед перезагрузкой убедиться, что все необходимые службы включены в автозапуск:
+
+```bash
+sudo systemctl is-enabled \
+  postgresql redis-server rabbitmq-server \
+  daphne supervisor nginx
+```
+
+При необходимости включить:
+
+```bash
+sudo systemctl enable \
+  postgresql redis-server rabbitmq-server \
+  daphne supervisor nginx
+```
+
+Согласованная перезагрузка:
+
+```bash
+sudo reboot
+```
+
+После восстановления SSH выполнить полный раздел «Быстрая проверка состояния».
+
+## 9. Установка UBKA с нуля или восстановление сервера
+
+Этот раздел используется при восстановлении `10.78.3.81` после переустановки или при создании идентичного экземпляра по отдельному согласованию.
+
+### 9.1. Требования
+
+- Ubuntu Server 24.04 LTS;
+- Python 3.12;
+- PostgreSQL 16;
+- достаточный объём диска для 142 GiB текущих данных, резервных копий и роста;
+- объём RAM и настройки Celery, соответствующие нагрузке;
+- сетевой доступ к HAProxy, внутренним API, почтовому серверу и внешним сервисам из `.env`.
+
+### 9.2. Системные пакеты
+
+```bash
+sudo apt update
+sudo apt install -y \
+  nginx supervisor \
+  python3 python3-venv python3-dev python3-pip \
+  build-essential pkg-config git rsync curl \
+  postgresql postgresql-contrib libpq-dev \
+  redis-server rabbitmq-server \
+  libmagic1 libgl1 libglib2.0-0 \
+  poppler-utils tesseract-ocr libreoffice
+```
+
+OCR-зависимости дополнительно сверить с файлами проекта:
+
+```text
+requirements_ocr.txt
+DEDOC_INSTALL_GUIDE.md
+OCR_SETUP.md
+```
+
+### 9.3. Пользователь и каталоги
+
+```bash
+sudo adduser --disabled-password --gecos '' user
+sudo install -d -o user -g user -m 0755 /home/user/ubka
+sudo install -d -o user -g user -m 0755 /home/user/logs
+```
+
+Если пользователь существует, повторно его не создавать:
+
+```bash
+id user
+```
+
+### 9.4. Восстановление файлов
+
+Восстановить из репозитория и резервной копии:
+
+```text
+/home/user/ubka/
+/home/user/ubka/media/
+/home/user/ubka/.env
+/etc/nginx/sites-available/default
+/etc/systemd/system/daphne.service
+/etc/supervisor/conf.d/*.conf
+/usr/local/sbin/database_backup.sh
+```
+
+Не восстанавливать старый каталог `/home/user/ubka/venv` и накопленные `*.log`.
+
+Права:
+
+```bash
+sudo chown -R user:user /home/user/ubka
+sudo chmod 600 /home/user/ubka/.env
+sudo install -d -o user -g www-data -m 0755 /home/user/ubka/temp_reports
+```
+
+### 9.5. Python-окружение
+
+```bash
+sudo -u user python3 -m venv /home/user/ubka/venv
+sudo -u user /home/user/ubka/venv/bin/python -m pip install --upgrade pip wheel setuptools
+sudo -u user /home/user/ubka/venv/bin/pip install -r /home/user/ubka/requirements.txt
+sudo -u user /home/user/ubka/venv/bin/pip install -r /home/user/ubka/requirements_ocr.txt
+```
+
+Проверка:
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/python manage.py check
+```
+
+## 10. PostgreSQL и восстановление БД
+
+### 10.1. Создание резервной копии
+
+Ручной дамп:
+
+```bash
+sudo -u postgres pg_dump \
+  --format=custom \
+  --file=/var/tmp/ubka2_$(date +%F_%H%M).dump \
+  ubka2
+```
+
+Проверить файл:
+
+```bash
+sudo ls -lh /var/tmp/ubka2_*.dump
+```
+
+
+
+### 10.2. Создание роли и базы после переустановки
+
+```bash
+sudo systemctl enable --now postgresql
+sudo -u postgres psql
+```
+
+В `psql`:
+
+```sql
+CREATE ROLE ubka LOGIN;
+\password ubka
+CREATE DATABASE ubka2 OWNER ubka;
+\q
+```
+
+Пароль должен соответствовать `SQL_PASSWORD` в `.env`.
+
+### 10.3. Восстановление
+
+```bash
+sudo -u postgres pg_restore \
+  --exit-on-error \
+  --no-owner \
+  --role=ubka \
+  --dbname=ubka2 \
+  /ПУТЬ/К/ubka2.dump
+```
+
+Проверка:
+
+```bash
+sudo -u postgres psql -d ubka2 -c '\dt'
+sudo -u postgres psql -Atc \
+"SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE datname='ubka2';"
+```
+
+## 11. Django после установки или обновления
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/python manage.py check
+sudo -u user ./venv/bin/python manage.py migrate --plan
+sudo -u user ./venv/bin/python manage.py migrate
+sudo -u user ./venv/bin/python manage.py collectstatic --noinput
+```
+
+Создание персональной административной учётной записи:
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/python manage.py createsuperuser
+```
+
+Не использовать общую учётную запись администратора.
+
+## 12. Конфигурация Daphne
+
+Файл: `/etc/systemd/system/daphne.service`.
+
+Рекомендуемое содержимое, соответствующее фактическому запуску:
+
+```ini
+[Unit]
+Description=Daphne ASGI server
+After=network.target postgresql.service redis-server.service rabbitmq-server.service
+Wants=postgresql.service redis-server.service rabbitmq-server.service
+
+[Service]
+Type=simple
+User=user
+Group=www-data
+WorkingDirectory=/home/user/ubka
+RuntimeDirectory=daphne
+RuntimeDirectoryMode=0755
+ExecStart=/home/user/ubka/venv/bin/daphne --unix-socket /run/daphne/daphne.sock --application-close-timeout 3600 --http-timeout 3600 ubka.asgi:application
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Применить:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now daphne
+sudo systemctl status daphne --no-pager -l
+sudo ls -l /run/daphne/daphne.sock
+```
+
+Перед заменой действующего файла сохранить его копию и сравнить с рекомендованным вариантом. Не менять рабочую конфигурацию без согласования.
+
+## 13. Конфигурация Supervisor
+
+Активные файлы:
+
+```text
+/etc/supervisor/conf.d/celery-beat.conf
+/etc/supervisor/conf.d/celery-import-export.conf
+/etc/supervisor/conf.d/celery-worker.conf
+/etc/supervisor/conf.d/celery.conf
+/etc/supervisor/conf.d/celery_exporter.conf
+/etc/supervisor/conf.d/django_bot.conf
+```
+
+Резервный `gunicorn.conf.bak` не подключать.
+
+После изменения конфигов:
+
+```bash
+sudo supervisorctl reread
+sudo supervisorctl update
+sudo supervisorctl status
+```
+
+Основные команды запуска:
+
+```text
+Celery beat:
+/home/user/ubka/venv/bin/celery --app=ubka beat --loglevel=INFO --scheduler django_celery_beat.schedulers:DatabaseScheduler
+
+Импорт/экспорт:
+/home/user/ubka/venv/bin/celery --app=ubka worker -c 2 -Q import_export --loglevel=INFO --hostname=import_export@%h
+
+Очереди default и ocr:
+/home/user/ubka/venv/bin/celery --app=ubka worker -c 4 -Q default,ocr --loglevel=INFO --hostname=worker@%h
+
+Общий Celery worker:
+/home/user/ubka/venv/bin/celery --app=ubka worker -c 10 --loglevel=INFO
+
+Exporter:
+/home/user/ubka/venv/bin/python /home/user/ubka/manage.py celery_exporter
+
+Бот:
+/home/user/ubka/venv/bin/python /home/user/ubka/manage.py bot
+```
+
+## 14. Конфигурация Nginx
+
+Рабочий файл: `/etc/nginx/sites-enabled/default`, обычно являющийся ссылкой на `/etc/nginx/sites-available/default`.
+
+Проверка:
+
+```bash
+sudo nginx -T
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Критичные параметры действующей конфигурации:
+
+```text
+listen 80
+client_max_body_size 10G
+root /home/user/ubka для static/media/templates
+proxy_pass http://unix:/run/daphne/daphne.sock
+proxy_read_timeout 86400 для приложения и WebSocket
+```
+
+Параметр `set_real_ip_from 10.20.30.0/28` должен соответствовать сети доверенного HAProxy. Не расширять доверенную сеть без согласования.
+
+## 15. Обновление кода приложения
+
+Перед обновлением зафиксировать текущую версию:
+
+```bash
+sudo -u user git -C /home/user/ubka rev-parse HEAD
+sudo -u user git -C /home/user/ubka status --short
+```
+
+Если есть незакоммиченные изменения, обновление остановить и согласовать их с разработчиком.
+
+Общий порядок:
+
+1. Создать дамп БД.
+2. Зафиксировать commit/version и подготовить откат кода.
+3. Получить утверждённую версию кода.
+4. Установить зависимости.
+5. Выполнить `check`, `migrate --plan`, `migrate`, `collectstatic`.
+6. Перезапустить Daphne и процессы Supervisor.
+7. Проверить Nginx и приложение.
+
+Команды после доставки кода:
+
+```bash
+cd /home/user/ubka
+sudo -u user ./venv/bin/pip install -r requirements.txt
+sudo -u user ./venv/bin/pip install -r requirements_ocr.txt
+sudo -u user ./venv/bin/python manage.py check
+sudo -u user ./venv/bin/python manage.py migrate --plan
+sudo -u user ./venv/bin/python manage.py migrate
+sudo -u user ./venv/bin/python manage.py collectstatic --noinput
+sudo systemctl restart daphne
+sudo supervisorctl restart all
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Команду получения кода (`git pull`, развёртывание артефакта или Ansible) указывать только после подтверждения принятого в проекте процесса доставки.
+
+## 16. Резервное копирование
+
+Текущий root-cron:
+
+```cron
+3 0 * * * /usr/local/sbin/database_backup.sh
+```
+
+Проверить:
+
+```bash
+sudo crontab -l
+sudo ls -l /usr/local/sbin/database_backup.sh
+sudo sed -n '1,240p' /usr/local/sbin/database_backup.sh
+```
+
+
+
+Ручной запуск разрешён только после проверки каталога назначения и свободного места:
+
+```bash
+sudo /usr/local/sbin/database_backup.sh
+```
+
+
+## 17. Ротация журналов
+
+Для предотвращения повторного роста `bot.log` создать после согласования `/etc/logrotate.d/ubka`:
+
+```text
+/home/user/logs/*.log /home/user/ubka/*.log /var/log/django_bot*.log /var/log/celery_exporter*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+Проверить без принудительной ротации:
+
+```bash
+sudo logrotate --debug /etc/logrotate.d/ubka
+```
+
+Не удалять и не обнулять текущий `bot.log` без согласования срока хранения журналов.
+
+## 18. Диагностика
+
+### Nginx
+
+```bash
+sudo nginx -t
+sudo journalctl -u nginx -n 100 --no-pager
+sudo tail -n 100 /var/log/nginx/error.log
+```
+
+### Daphne/Django
+
+```bash
+sudo systemctl status daphne --no-pager -l
+sudo journalctl -u daphne -n 200 --no-pager
+sudo -u user /home/user/ubka/venv/bin/python /home/user/ubka/manage.py check
+```
+
+### Celery и служебные процессы
+
+```bash
+sudo supervisorctl status
+sudo tail -n 100 /home/user/logs/celery.log
+sudo tail -n 100 /home/user/logs/celery-worker.log
+sudo tail -n 100 /home/user/logs/celery-import-export.log
+sudo tail -n 100 /var/log/django_bot.err.log
+sudo tail -n 100 /var/log/celery_exporter.err.log
+```
+
+### PostgreSQL
+
+```bash
+sudo systemctl status postgresql@16-main --no-pager
+sudo -u postgres pg_isready
+sudo -u postgres psql -d ubka2 -c 'SELECT now();'
+```
+
+### Redis и RabbitMQ
+
+```bash
+redis-cli ping
+sudo rabbitmq-diagnostics ping
+```
+
+### Ресурсы
+
+```bash
+df -h
+free -h
+ps aux --sort=-%mem | head -20
+sudo du -h --max-depth=1 /home/user/ubka | sort -h
+```
+
+### HTTP
+
+```bash
+curl -v -H 'Host: ubka.gasvybory2.ru' http://127.0.0.1/
+curl -k -sS -D- -o /dev/null https://ubka.gasvybory2.ru/
+```
+
+## 19. Откат после неудачного обновления
+
+1. Остановить Nginx, Daphne и процессы Supervisor.
+2. Вернуть предыдущую утверждённую версию кода.
+3. Если обновление меняло схему БД, применить заранее подготовленный и согласованный план обратной миграции либо восстановить дамп.
+4. Заново установить зависимости предыдущей версии, если они менялись.
+5. Выполнить `manage.py check`.
+6. Запустить компоненты в штатном порядке.
+7. Проверить локальный и внешний HTTP-ответ, вход, статику, WebSocket, импорт/экспорт, OCR и фоновые задачи.
+
+Восстановление старого дампа уничтожает изменения, внесённые после его создания. Выполнять его можно только с разрешения владельца данных.
+
+## 20. Контрольный чек-лист
+
+- [ ] Доступ на `10.78.3.81` проверен.
+- [ ] Nginx, Daphne, Supervisor, PostgreSQL, Redis и RabbitMQ активны.
+- [ ] Все процессы Supervisor имеют состояние `RUNNING`.
+- [ ] `/run/daphne/daphne.sock` существует и доступен Nginx.
+- [ ] `manage.py check` не возвращает ошибок.
+- [ ] Локальный запрос возвращает ожидаемый `302` на страницу входа.
+- [ ] Внешний адрес `ubka.gasvybory2.ru` отвечает штатно.
+- [ ] Проверены свободное место, RAM и swap.
+- [ ] Работает ежедневное резервное копирование БД.
+- [ ] Настроена и проверена ротация журналов.
+- [ ] Для обновлений зафиксированы версия кода, резервная копия и план отката.
+- [ ] Создана персональная административная учётная запись.
+
