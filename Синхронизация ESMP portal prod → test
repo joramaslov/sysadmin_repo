@@ -1,0 +1,299 @@
+# Синхронизация ESMP prod → test
+
+**Версия:** 1.0  
+**Окружение:** ALT Server 10.1, PostgreSQL, Docker Compose  
+**Применимо к:** esmp / esmp_test (инвентори Ansible)
+
+---
+
+## Архитектура
+
+| Хост | Роль | Контейнеры |
+|------|------|-----------|
+| app-esmp-db | БД прод | PostgreSQL (systemd) |
+| app-esmp-db-test | БД тест | PostgreSQL (systemd) |
+| app-esmp-cp-test | Корп. портал | cp-app, cp-web, cp-sphinx, cp-pg_tools |
+| app-esmp-sm-test | OTRS / SM | sm-otrs-webapp, sm-web, kafka, redis, elastic |
+| app-esmp-mt-test | Mail transport | mt-app, mt-web |
+| app-esmp-lb-test | Балансировщик | esmp-ingress (nginx) |
+
+**БД для синхронизации:** `cp_db`, `helpme`, `metricadb`, `otrs_rt`, `sm_stat`
+
+---
+
+## Шаг 1 — Бэкап тестовых БД
+
+Выполнять на `app-esmp-db-test` перед любыми изменениями.
+
+```bash
+BACKUP_DIR="/var/lib/pgsql/backup_before_sync_$(date +%Y%m%d)"
+sudo mkdir -p $BACKUP_DIR
+sudo chown postgres:postgres $BACKUP_DIR
+
+for DB in cp_db helpme metricadb otrs_rt sm_stat; do
+  echo "Бэкап $DB..."
+  sudo -u postgres pg_dump -Fc -f ${BACKUP_DIR}/${DB}.dump $DB
+  echo "Готово: $(sudo du -sh ${BACKUP_DIR}/${DB}.dump)"
+done
+```
+
+---
+
+## Шаг 2 — Снять дампы с прода
+
+Выполнять на `app-esmp-db`.
+
+```bash
+for DB in cp_db helpme metricadb otrs_rt sm_stat; do
+  echo "Дамп $DB..."
+  sudo -u postgres pg_dump -d $DB -F c -b -v -f /var/tmp/${DB}.dump
+done
+```
+
+Скопировать дампы на тест:
+
+```bash
+scp /var/tmp/*.dump maslovgs@app-esmp-db-test:/var/tmp/
+```
+
+---
+
+## Шаг 3 — Отключить отправку почты
+
+### 3.1 Выставить DISABLE_MAIL=1
+
+```bash
+ssh app-esmp-sm-test
+sudo sed -i 's/DISABLE_MAIL=0/DISABLE_MAIL=1/' /opt/esmp/sm/.env
+sudo grep DISABLE_MAIL /opt/esmp/sm/.env   # убедиться что =1
+```
+
+### 3.2 Заблокировать SMTP на уровне сети
+
+```bash
+# На app-esmp-sm-test и app-esmp-mt-test
+for HOST in app-esmp-sm-test app-esmp-mt-test; do
+  ssh $HOST "sudo iptables -A OUTPUT -p tcp --dport 25 -j DROP && \
+             sudo iptables -A OUTPUT -p tcp --dport 587 -j DROP"
+done
+```
+
+---
+
+## Шаг 4 — Остановить контейнеры
+
+```bash
+ssh app-esmp-mt-test "cd /opt/esmp/mt && sudo docker compose down"
+ssh app-esmp-sm-test "cd /opt/esmp/sm && sudo docker compose down"
+ssh app-esmp-cp-test "cd /opt/esmp/cp && sudo docker compose down"
+ssh app-esmp-lb-test "sudo docker stop esmp-ingress"
+```
+
+---
+
+## Шаг 5 — Restore БД на тесте
+
+Скрипт запускать на `app-esmp-db-test`.
+
+```bash
+sudo bash /var/tmp/restore_esmp_test.sh 2>&1 | tee /var/tmp/restore_$(date +%Y%m%d_%H%M%S).log
+```
+
+Содержимое скрипта `/var/tmp/restore_esmp_test.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+DUMP_DIR="/var/tmp"
+PG_USER="postgres"
+DATABASES=("cp_db" "helpme" "metricadb" "otrs_rt" "sm_stat")
+
+echo "=== Создаём недостающие роли ==="
+sudo -u "$PG_USER" psql -d postgres -c "
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'alert_bot') THEN
+    CREATE ROLE alert_bot; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'monitoring_neiro_rag') THEN
+    CREATE ROLE monitoring_neiro_rag; END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'nikita') THEN
+    CREATE ROLE nikita CREATEROLE;
+  ELSE
+    ALTER ROLE nikita CREATEROLE; END IF;
+END \$\$;"
+
+for DB in "${DATABASES[@]}"; do
+  DUMP_FILE="$DUMP_DIR/${DB}.dump"
+
+  if [[ ! -f "$DUMP_FILE" ]]; then
+    echo "ПРОПУСК: файл $DUMP_FILE не найден!"
+    continue
+  fi
+
+  echo ""
+  echo "=== [$DB] Начало restore ($(sudo du -sh $DUMP_FILE | cut -f1)) ==="
+
+  sudo -u "$PG_USER" psql -d postgres -c \
+    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+     WHERE datname = '$DB' AND pid <> pg_backend_pid();"
+
+  sudo -u "$PG_USER" psql -d postgres -c "DROP DATABASE IF EXISTS $DB;"
+  sudo -u "$PG_USER" psql -d postgres -c "CREATE DATABASE $DB;"
+
+  sudo -u "$PG_USER" pg_restore \
+    -d "$DB" \
+    --no-owner \
+    --no-privileges \
+    "$DUMP_FILE" || echo "⚠️  [$DB] pg_restore завершился с предупреждениями — проверь лог"
+
+  echo "=== [$DB] Готово ==="
+done
+
+echo ""
+echo "=== Все базы восстановлены ==="
+```
+
+---
+
+## Шаг 6 — Починить права после restore
+
+После `--no-privileges` пользователи теряют права на таблицы. Выполнять на `app-esmp-db-test`.
+
+```bash
+# helpme — для cp-app
+sudo -u postgres psql -d helpme -c "
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO helpme;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO helpme;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO portal;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO portal;
+"
+
+# otrs_rt — для sm-otrs
+sudo -u postgres psql -d otrs_rt -c "
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO otrs;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO otrs;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA report TO otrs;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA report TO otrs;
+"
+```
+
+---
+
+## Шаг 7 — Обновить materialized views в otrs_rt
+
+```bash
+for VIEW in \
+  "public.std_eav_customer_users" \
+  "public.std_new_eav_customer_users" \
+  "public.custom_eav_customer_users" \
+  "public.custom_new_eav_customer_users" \
+  "public.customer_user_phone" \
+  "public.group_worktrip" \
+  "public.std_eav_customer_companies" \
+  "public.std_new_eav_customer_companies" \
+  "report.dashboard_paip_analysts" \
+  "report.dashboard_paip_analysts_2" \
+  "report.mv_cust_rep_j" \
+  "report.mv_rep_010125_extended" \
+  "report.n_dash_modification"; do
+    echo "REFRESH: $VIEW"
+    sudo -u postgres psql -d otrs_rt -c "REFRESH MATERIALIZED VIEW ${VIEW};"
+done
+```
+
+> Выполнять строго по одной — некоторые views зависят от предыдущих.
+
+---
+
+## Шаг 8 — Починить Liquibase lock (если cp-app не стартует)
+
+Если `cp-app-1` падает с ошибкой `relation "databasechangeloglock" already exists`:
+
+```bash
+# Восстановить Liquibase таблицы из дампа
+sudo -u postgres pg_restore \
+  -d helpme \
+  --no-owner \
+  --no-privileges \
+  --data-only \
+  -t databasechangelog \
+  /var/tmp/helpme.dump
+
+# Проверить
+sudo -u postgres psql -d helpme -c "SELECT count(*) FROM public.databasechangelog;"
+# Должно быть > 0 (обычно ~686)
+```
+
+---
+
+## Шаг 9 — Поднять контейнеры
+
+```bash
+ssh app-esmp-lb-test "sudo docker start esmp-ingress"
+ssh app-esmp-cp-test "cd /opt/esmp/cp && sudo docker compose up -d"
+ssh app-esmp-sm-test "cd /opt/esmp/sm && sudo docker compose up -d"
+ssh app-esmp-mt-test "cd /opt/esmp/mt && sudo docker compose up -d"
+```
+
+---
+
+## Шаг 10 — Проверка
+
+### Статус контейнеров
+
+```bash
+for HOST in app-esmp-cp-test app-esmp-sm-test app-esmp-mt-test app-esmp-lb-test; do
+  echo "=== $HOST ==="
+  ssh $HOST "sudo docker ps --format 'table {{.Names}}\t{{.Status}}'"
+done
+```
+
+### Проверка что письма не уходят
+
+```bash
+ssh app-esmp-sm-test "sudo docker logs sm-otrs-webapp-1 --tail 30"
+# Строк "Sending email" / "SMTP" быть не должно
+```
+
+### Проверка БД
+
+```bash
+ssh app-esmp-db-test "sudo -u postgres psql -c '\l'" | \
+  grep -E 'cp_db|helpme|metricadb|otrs_rt|sm_stat'
+```
+
+---
+
+## Шаг 11 — Снять блокировку почты (после тестов)
+
+```bash
+for HOST in app-esmp-sm-test app-esmp-mt-test; do
+  ssh $HOST "sudo iptables -D OUTPUT -p tcp --dport 25 -j DROP && \
+             sudo iptables -D OUTPUT -p tcp --dport 587 -j DROP"
+done
+
+# Вернуть DISABLE_MAIL=0
+ssh app-esmp-sm-test "sudo sed -i 's/DISABLE_MAIL=1/DISABLE_MAIL=0/' /opt/esmp/sm/.env"
+ssh app-esmp-sm-test "cd /opt/esmp/sm && sudo docker compose restart sm-otrs-webapp-1"
+```
+
+---
+
+## Известные проблемы и решения
+
+| Проблема | Причина | Решение |
+|----------|---------|---------|
+| `permission denied for table X` | `--no-privileges` при restore | Шаг 6 — GRANT для нужной БД и роли |
+| `relation "databasechangeloglock" already exists` | Liquibase lock из продового дампа | Шаг 8 — восстановить только changelog таблицы |
+| Materialized views пустые после restore | Тип `subscriptions_object_type` создаётся позже порядка restore | Шаг 7 — REFRESH по одному |
+| `cp-app-1` unhealthy 75s | healthcheck `sleep 60` — это нормально, приложение стартует ~60с | Ждать, смотреть логи |
+
+---
+
+## Защита от случайной рассылки — три уровня
+
+| Уровень | Что делает | Когда снимать |
+|---------|-----------|---------------|
+| `docker compose down` | Приложение не работает во время restore | Автоматически при `up` |
+| `DISABLE_MAIL=1` | OTRS не отправляет письма | После завершения тестов |
+| `iptables DROP 25/587` | Блокировка на уровне ОС | После завершения тестов |
