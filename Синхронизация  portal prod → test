@@ -1,8 +1,8 @@
-# Синхронизация ESMP prod → test
+# Синхронизация prod → test
 
 **Версия:** 1.0  
 **Окружение:** ALT Server 10.1, PostgreSQL, Docker Compose  
-**Применимо к:** esmp / esmp_test (инвентори Ansible)
+**Применимо к:**  / test (инвентори Ansible)
 
 ---
 
@@ -10,12 +10,12 @@
 
 | Хост | Роль | Контейнеры |
 |------|------|-----------|
-| app-esmp-db | БД прод | PostgreSQL (systemd) |
-| app-esmp-db-test | БД тест | PostgreSQL (systemd) |
-| app-esmp-cp-test | Корп. портал | cp-app, cp-web, cp-sphinx, cp-pg_tools |
-| app-esmp-sm-test | OTRS / SM | sm-otrs-webapp, sm-web, kafka, redis, elastic |
-| app-esmp-mt-test | Mail transport | mt-app, mt-web |
-| app-esmp-lb-test | Балансировщик | esmp-ingress (nginx) |
+| app--db | БД прод | PostgreSQL (systemd) |
+| app--db-test | БД тест | PostgreSQL (systemd) |
+| app--cp-test | Корп. портал | cp-app, cp-web, cp-sphinx, cp-pg_tools |
+| app--sm-test | OTRS / SM | sm-otrs-webapp, sm-web, kafka, redis, elastic |
+| app--mt-test | Mail transport | mt-app, mt-web |
+| app--lb-test | Балансировщик | esmp-ingress (nginx) |
 
 **БД для синхронизации:** `cp_db`, `helpme`, `metricadb`, `otrs_rt`, `sm_stat`
 
@@ -23,7 +23,7 @@
 
 ## Шаг 1 — Бэкап тестовых БД
 
-Выполнять на `app-esmp-db-test` перед любыми изменениями.
+Выполнять на `app--db-test` перед любыми изменениями.
 
 ```bash
 BACKUP_DIR="/var/lib/pgsql/backup_before_sync_$(date +%Y%m%d)"
@@ -41,7 +41,7 @@ done
 
 ## Шаг 2 — Снять дампы с прода
 
-Выполнять на `app-esmp-db`.
+Выполнять на `app--db`.
 
 ```bash
 for DB in cp_db helpme metricadb otrs_rt sm_stat; do
@@ -83,20 +83,20 @@ done
 ## Шаг 4 — Остановить контейнеры
 
 ```bash
-ssh app-esmp-mt-test "cd /opt/esmp/mt && sudo docker compose down"
-ssh app-esmp-sm-test "cd /opt/esmp/sm && sudo docker compose down"
-ssh app-esmp-cp-test "cd /opt/esmp/cp && sudo docker compose down"
-ssh app-esmp-lb-test "sudo docker stop esmp-ingress"
+ssh app--mt-test "cd /opt/esmp/mt && sudo docker compose down"
+ssh app--sm-test "cd /opt/esmp/sm && sudo docker compose down"
+ssh app--cp-test "cd /opt/esmp/cp && sudo docker compose down"
+ssh app--lb-test "sudo docker stop esmp-ingress"
 ```
 
 ---
 
 ## Шаг 5 — Restore БД на тесте
 
-Скрипт запускать на `app-esmp-db-test`.
+Скрипт запускать на `app--db-test`.
 
 ```bash
-sudo bash /var/tmp/restore_esmp_test.sh 2>&1 | tee /var/tmp/restore_$(date +%Y%m%d_%H%M%S).log
+sudo bash /var/tmp/restore__test.sh 2>&1 | tee /var/tmp/restore_$(date +%Y%m%d_%H%M%S).log
 ```
 
 Содержимое скрипта `/var/tmp/restore_esmp_test.sh`:
@@ -229,10 +229,10 @@ sudo -u postgres psql -d helpme -c "SELECT count(*) FROM public.databasechangelo
 ## Шаг 9 — Поднять контейнеры
 
 ```bash
-ssh app-esmp-lb-test "sudo docker start esmp-ingress"
-ssh app-esmp-cp-test "cd /opt/esmp/cp && sudo docker compose up -d"
-ssh app-esmp-sm-test "cd /opt/esmp/sm && sudo docker compose up -d"
-ssh app-esmp-mt-test "cd /opt/esmp/mt && sudo docker compose up -d"
+ssh app-lb-test "sudo docker start esmp-ingress"
+ssh app-cp-test "cd /opt/esmp/cp && sudo docker compose up -d"
+ssh app-sm-test "cd /opt/esmp/sm && sudo docker compose up -d"
+ssh app-mt-test "cd /opt/esmp/mt && sudo docker compose up -d"
 ```
 
 ---
